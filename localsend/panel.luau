@@ -1,14 +1,23 @@
 --!nonstrict
 -- Panel: nearby devices (click to pick files and send) and the transfer list.
 
-local HEADERS = { "X-LocalSend-Ctl: 1", "Content-Type: application/json" }
+-- The daemon writes a private token (mode 0600) next to its certificate; every control request must carry it.
+local cachedToken = nil
+local function headers()
+  if cachedToken == nil then
+    local path = noctalia.pluginDataDir() .. "/control.token"
+    cachedToken = noctalia.fileExists(path) and noctalia.readFile(path) or nil
+  end
+  return { "X-LocalSend-Token: " .. (cachedToken or ""), "Content-Type: application/json" }
+end
+local function forgetToken() cachedToken = nil end
 local open = false
 
 local function ctl(path) return "http://127.0.0.1:" .. noctalia.getConfig("control_port") .. path end
 
 local function post(path, body)
   noctalia.http({
-    url = ctl(path), method = "POST", headers = HEADERS,
+    url = ctl(path), method = "POST", headers = headers(),
     body = noctalia.json.encode(body or {}),
   }, function() end)
 end

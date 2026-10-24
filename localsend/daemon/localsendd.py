@@ -12,8 +12,10 @@ and exposes a small loopback-only HTTP API that the Noctalia plugin drives:
   POST /rescan
   POST /quit
 
-Every control request must carry the header `X-LocalSend-Ctl: 1`; browsers cannot
-add it cross-origin without a preflight, which this server never answers.
+Every control request must carry the header `X-LocalSend-Token` with the secret the
+daemon writes (mode 0600, inside its 0700 data directory) to `control.token` at start,
+so only the owning user can drive it, and the `Host` header must be the loopback
+address, which also defeats DNS rebinding.
 """
 import argparse
 import getpass
@@ -39,6 +41,7 @@ MCAST_ADDR = "224.0.0.167"
 PEER_TTL = 75
 ANNOUNCE_EVERY = 20
 PROMPT_TIMEOUT = 60
+STALL_TIMEOUT = 120
 CHUNK = 256 * 1024
 MAX_TEXT = 1024 * 1024
 MAX_FILES = 5000
@@ -49,6 +52,7 @@ me = {}
 peers = {}      # fingerprint -> peer dict
 sessions = {}   # id -> session dict
 stop_event = threading.Event()
+ctl_token = ""   # secret for the control API, see main()
 
 
 def log(*a):
@@ -208,6 +212,9 @@ def maintenance():
             announce()
             last = now
         with lock:
+            for s in sessions.values():  # a sender that went quiet must not block the receiver forever
+                if s["direction"] == "in" and s["status"] == "receiving" and now - s["updated"] > STALL_TIMEOUT:
+                    s.update(status="failed", error="timed out", updated=now)
             for fp in [f for f, p in peers.items() if now - p["lastSeen"] > PEER_TTL]:
                 del peers[fp]
             for sid in [s for s, v in sessions.items()
@@ -260,10 +267,30 @@ def unique_path(directory, name):
     path = os.path.join(directory, name)
     stem, ext = os.path.splitext(name)
     n = 1
-    while os.path.exists(path):
+    while os.path.lexists(path):  # lexists: a dangling symlink also counts as taken
         path = os.path.join(directory, f"{stem} ({n}){ext}")
         n += 1
     return path
+
+
+def publish(tmp, dest):
+    """Move tmp to dest without ever replacing an existing file (or following a symlink)."""
+    directory, name = os.path.split(dest)
+    while True:
+        try:
+            os.link(tmp, dest)  # fails with FileExistsError instead of overwriting
+        except FileExistsError:
+            dest = unique_path(directory, name)
+            continue
+        except OSError:
+            # Filesystem without hard links: fall back to a check-then-rename.
+            if os.path.lexists(dest):
+                dest = unique_path(directory, name)
+                continue
+            os.rename(tmp, dest)
+            return dest
+        os.remove(tmp)
+        return dest
 
 
 # ---------------------------------------------------------------- receiving (HTTPS server)
@@ -397,15 +424,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(403, {"message": "Invalid token or IP address"})
         f = next(x for x in s["files"] if x["id"] == fid)
         os.makedirs(cfg.save_dir, exist_ok=True)
-        dest = unique_path(cfg.save_dir, f["name"])
-        root = os.path.realpath(cfg.save_dir)
-        if not os.path.realpath(dest).startswith(root + os.sep):
+        dest = os.path.realpath(unique_path(cfg.save_dir, f["name"]))
+        if not dest.startswith(os.path.realpath(cfg.save_dir) + os.sep):
             return self.reply(403, {"message": "Invalid file name"})
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        tmp = dest + ".part"
+        # A fresh, randomly named temp file that must not exist and is never a symlink:
+        # nothing already on disk can be truncated or redirected.
+        tmp = os.path.join(os.path.dirname(dest), f".{uuid.uuid4().hex}.part")
         h = hashlib.sha256()
         try:
-            with open(tmp, "wb") as out:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666)
+            with os.fdopen(fd, "wb") as out:
                 for chunk in self.body_chunks():
                     if s["cancel"]:
                         raise RuntimeError("cancelled")
@@ -427,7 +456,11 @@ class Handler(BaseHTTPRequestHandler):
             os.remove(tmp)
             touch(s, status="failed", error="checksum mismatch")
             return self.reply(422, {"message": "Checksum mismatch"})
-        os.rename(tmp, dest)
+        try:
+            dest = publish(tmp, dest)
+        except OSError as e:
+            touch(s, status="failed", error=str(e))
+            return self.reply(500, {"message": "Could not save file"})
         with lock:
             f["saved"] = True
             if all(x.get("saved") for x in s["files"]):
@@ -542,8 +575,11 @@ class Control(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def guard(self):
-        if self.headers.get("X-LocalSend-Ctl") != "1":
-            self.reply(403, {"error": "missing header"})
+        host = (self.headers.get("Host") or "").split(":")[0]
+        supplied = self.headers.get("X-LocalSend-Token") or ""
+        if host not in ("127.0.0.1", "localhost") or \
+                not secrets.compare_digest(supplied.encode(), ctl_token.encode()):
+            self.reply(403, {"error": "forbidden"})
             return False
         return True
 
@@ -610,21 +646,33 @@ class Control(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- main
 
 def main():
-    global cfg, me
+    global cfg, me, ctl_token
     ap = argparse.ArgumentParser()
     xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     ap.add_argument("--data-dir", default=os.path.join(xdg, "localsendd"))
     ap.add_argument("--save-dir", default=os.path.expanduser("~/Downloads/LocalSend"))
     host = socket.gethostname()
     ap.add_argument("--alias", default=getpass.getuser() if host == "localhost" else host)
-    ap.add_argument("--pin", default="", help="require this PIN from senders")
+    ap.add_argument("--pin-file", default="",
+                    help="file holding the PIN senders must provide; read once, then deleted")
     ap.add_argument("--port", type=int, default=53317)
     ap.add_argument("--control-port", type=int, default=53318)
     ap.add_argument("--auto-accept", action="store_true")
     cfg = ap.parse_args()
     cfg.save_dir = os.path.expanduser(cfg.save_dir)
+    cfg.pin = ""
     os.makedirs(cfg.data_dir, mode=0o700, exist_ok=True)
+    os.chmod(cfg.data_dir, 0o700)
+    if cfg.pin_file:
+        try:
+            with open(cfg.pin_file) as f:
+                cfg.pin = f.read().strip()
+            os.remove(cfg.pin_file)  # keep the PIN out of argv and off disk
+        except OSError:
+            pass
+    old_umask = os.umask(0o077)  # key and token are never group/world readable, even briefly
     cert, key, fp = ensure_cert(cfg.data_dir)
+    os.umask(old_umask)
     me = {"alias": cfg.alias, "fingerprint": fp, "cert": cert, "key": key}
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -634,6 +682,16 @@ def main():
     server.socket = ctx.wrap_socket(server.socket, server_side=True)
     control = ThreadingHTTPServer(("127.0.0.1", cfg.control_port), Control)
     control.daemon_threads = True
+
+    # Only now, with both ports bound, publish the token: an instance that failed to start
+    # (port already taken by a live daemon) must not overwrite the live daemon's token.
+    os.umask(0o077)
+    ctl_token = secrets.token_urlsafe(32)
+    fd = os.open(os.path.join(cfg.data_dir, "control.token"),
+                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(ctl_token)
+    os.umask(old_umask)
 
     for fn in (server.serve_forever, control.serve_forever, udp_listener, maintenance):
         threading.Thread(target=fn, daemon=True).start()

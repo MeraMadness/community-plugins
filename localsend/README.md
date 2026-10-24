@@ -59,12 +59,13 @@ noctalia msg plugin mera/localsend:service all rescan      # announce again and 
 
 - **Architecture.** `service.luau` starts `daemon/localsendd.py`, a small background process that handles LocalSend
   discovery (UDP multicast `224.0.0.167:53317`), the HTTPS server for receiving, and sending. The Luau side only talks to
-  it over `http://127.0.0.1:<control port>`, and every request must carry an `X-LocalSend-Ctl: 1` header so web pages
-  cannot drive it.
+  it over `http://127.0.0.1:<control port>`. Every request must carry a random per-run token that the daemon writes to
+  `control.token` (mode 0600, in its private 0700 data directory), so only your user can drive it. The PIN is handed to
+  the daemon through a file it deletes after reading, not on the command line.
 - **Network.** Multicast announcements on the local network, an HTTPS server on the LocalSend port, and HTTPS requests
   to other devices on the LAN. Nothing leaves your network and no remote code is downloaded.
 - **Files.** Writes only to the save folder (names are sanitised and cannot escape it) and to the plugin data directory
-  (device certificate and private key, mode 600). Files you pick are read, never modified.
+  (device certificate, private key and control token, mode 600). Files you pick are read, never modified.
 - **Processes.** `python3` for the daemon, `openssl` once to create the certificate, `zenity` for file pickers.
 - **Security.** Transfers use TLS with a self-signed per-device certificate, as LocalSend does. Without a PIN, anyone on
   your network can send you a request (you still have to accept it unless auto-accept is on).

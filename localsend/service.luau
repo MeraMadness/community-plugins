@@ -3,7 +3,16 @@
 -- widget and panel through noctalia.state ("ls").
 
 local PANEL = "mera/localsend:panel"
-local HEADERS = { "X-LocalSend-Ctl: 1", "Content-Type: application/json" }
+-- The daemon writes a private token (mode 0600) next to its certificate; every control request must carry it.
+local cachedToken = nil
+local function headers()
+  if cachedToken == nil then
+    local path = noctalia.pluginDataDir() .. "/control.token"
+    cachedToken = noctalia.fileExists(path) and noctalia.readFile(path) or nil
+  end
+  return { "X-LocalSend-Token: " .. (cachedToken or ""), "Content-Type: application/json" }
+end
+local function forgetToken() cachedToken = nil end
 
 local function ctl(path) return "http://127.0.0.1:" .. noctalia.getConfig("control_port") .. path end
 
@@ -25,10 +34,13 @@ local function spawn()
     table.insert(argv, "--alias")
     table.insert(argv, alias)
   end
+  -- The PIN goes through a file the daemon reads and deletes, never through the command line.
+  local pinFile = noctalia.pluginDataDir() .. "/pin"
   local pin = noctalia.getConfig("pin")
   if pin ~= nil and pin ~= "" then
-    table.insert(argv, "--pin")
-    table.insert(argv, pin)
+    noctalia.writeFile(pinFile, pin)
+    table.insert(argv, "--pin-file")
+    table.insert(argv, pinFile)
   end
   if noctalia.getConfig("auto_accept") then table.insert(argv, "--auto-accept") end
   noctalia.runAsync(argv)
@@ -60,8 +72,9 @@ local function notifyChanges(sessions)
 end
 
 local function poll()
-  noctalia.http({ url = ctl("/state"), method = "GET", headers = HEADERS }, function(res)
+  noctalia.http({ url = ctl("/state"), method = "GET", headers = headers() }, function(res)
     if not res.ok or res.status ~= 200 then
+      forgetToken() -- a restarted daemon has a new token
       noctalia.state.set("ls", { up = false })
       return
     end
@@ -77,7 +90,7 @@ function update()
   ticks = ticks + 1
   if phase == "quit_old" then
     -- A daemon from a previous run may still hold stale settings: replace it.
-    noctalia.http({ url = ctl("/quit"), method = "POST", headers = HEADERS, body = "{}" },
+    noctalia.http({ url = ctl("/quit"), method = "POST", headers = headers(), body = "{}" },
       function() end)
     phase = "spawning"
     ticks = 0
@@ -97,13 +110,13 @@ end
 
 function onIpc(event, payload)
   if event == "rescan" then
-    noctalia.http({ url = ctl("/rescan"), method = "POST", headers = HEADERS, body = "{}" },
+    noctalia.http({ url = ctl("/rescan"), method = "POST", headers = headers(), body = "{}" },
       function() end)
   end
 end
 
 function onExit(signal, reason)
-  noctalia.http({ url = ctl("/quit"), method = "POST", headers = HEADERS, body = "{}" },
+  noctalia.http({ url = ctl("/quit"), method = "POST", headers = headers(), body = "{}" },
     function() end)
 end
 
